@@ -310,20 +310,25 @@ def weights_file_to_nc(h5_file, out_dir):
     print(f"Finished exporting {exported} layers from {h5_file}")
 
 def compile_and_train(model, X_train, Y_train, X_val, Y_val,
-                      lr=1e-4, batch_size=256, epochs=100, out_dir="./ResCNN_results"):
+                      lr=1e-4, batch_size=256, epochs=100, out_dir="./ResCNN_results",
+                      loss_type="qhybrid", q_loss_weight=2.0, q_upper_weight=3.0, q_grad_weight=0.5):
     os.makedirs(out_dir, exist_ok=True)
-    if model == "2d_conv":
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(lr),
-            loss=Res.weighted_mse,#loss=tf.keras.losses.Huber(),
-            metrics=[tf.keras.metrics.MeanSquaredError()]
+    if loss_type == "weighted_mse":
+        loss_fn = Res.weighted_mse
+    elif loss_type == "qhybrid":
+        loss_fn = Res.make_q_hybrid_loss(
+            q_idx=3,
+            q_loss_weight=q_loss_weight,
+            q_upper_weight=q_upper_weight,
+            q_grad_weight=q_grad_weight,
         )
     else:
-        model.compile(
+        loss_fn = tf.keras.losses.Huber()
+    model.compile(
         optimizer=tf.keras.optimizers.Adam(lr),
-        loss=tf.keras.losses.Huber(),
-        metrics=[tf.keras.metrics.MeanSquaredError()]
-        )
+        loss=loss_fn,
+        metrics=[tf.keras.metrics.MeanSquaredError(), Res.q_rmse_metric(q_idx=3)]
+    )
     best_h5=os.path.join(out_dir,"best_model.h5")
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
@@ -493,6 +498,15 @@ def evaluate_model(model, X_test, Y_test, ds_out, out_dir, var_names=("U","V","T
 
     metrics_out["r2_by_level_norm"] = r2_by_level
     metrics_out["rmse_by_level_norm"] = rmse_by_level
+    if "Q" in var_names:
+        q_idx = var_names.index("Q")
+        q_rmse_lev = np.array(rmse_by_level["Q"], dtype=np.float32)
+        nlev = q_rmse_lev.shape[0]
+        upper_start = int(np.floor(0.7 * nlev))
+        lower_end = int(np.ceil(0.3 * nlev))
+        metrics_out["q_rmse_upper_norm"] = float(np.nanmean(q_rmse_lev[upper_start:]))
+        metrics_out["q_rmse_lower_norm"] = float(np.nanmean(q_rmse_lev[:lower_end]))
+        metrics_out["q_rmse_all_norm"] = float(np.nanmean(q_rmse_lev))
 
     lev_values = ds_out["lev"].values if "lev" in ds_out.coords else np.arange(Y_test.shape[1])
 
@@ -588,18 +602,49 @@ def build_run_name(args):
     )
     return run_name
 def main():
+    def apply_norm_preset(args):
+        # 按归一化方式给出默认推荐配置：
+        # 1) 全变量统一归一化：Q动态范围更吃亏，增加Q分支与Q约束
+        # 2) 逐层归一化：层间尺度已平衡，可减小Q额外约束避免过拟合
+        if args.norm_mode == "global":
+            args.model_type = "rescnn_qbranch"
+            args.loss_type = "qhybrid"
+            args.learning_rate = 1e-4
+            args.batch_size = 256
+            args.q_loss_weight = 2.5
+            args.q_upper_weight = 3.5
+            args.q_grad_weight = 0.6
+        elif args.norm_mode == "level":
+            args.model_type = "rescnn"
+            args.loss_type = "qhybrid"
+            args.learning_rate = 8e-5
+            args.batch_size = 256
+            args.q_loss_weight = 1.2
+            args.q_upper_weight = 2.0
+            args.q_grad_weight = 0.25
+        return args
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_file", type=str,
                         default=os.path.join(data_path,inputdata))
     parser.add_argument("--output_file", type=str,
                         default=os.path.join(data_path,outputdata))
-    parser.add_argument("--model_type", type=str, default="rescnn", choices=["mlp", "rescnn", "gru","cnn","2d_conv"])
+    parser.add_argument("--model_type", type=str, default="rescnn",
+                        choices=["mlp", "rescnn", "rescnn_qbranch", "gru", "cnn", "2d_conv"])
+    parser.add_argument("--norm_mode", type=str, default="custom",
+                        choices=["custom", "global", "level"])
     parser.add_argument("--ntimes_input", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--loss_type", type=str, default="qhybrid",
+                        choices=["qhybrid", "weighted_mse", "huber"])
+    parser.add_argument("--q_loss_weight", type=float, default=2.0)
+    parser.add_argument("--q_upper_weight", type=float, default=3.0)
+    parser.add_argument("--q_grad_weight", type=float, default=0.5)
 
     args = parser.parse_args()
+    args = apply_norm_preset(args)
     run_name = build_run_name(args)
     out_dir = os.path.join(data_path, run_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -637,6 +682,8 @@ def main():
         model = Res.build_mlp_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
     elif args.model_type == "rescnn":
         model = Res.build_rescnn_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
+    elif args.model_type == "rescnn_qbranch":
+        model = Res.build_rescnn_qbranch_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
     elif args.model_type == "gru":
         model = Res.build_gru_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
     elif args.model_type == "cnn":
@@ -657,7 +704,11 @@ def main():
         lr=args.learning_rate,
         batch_size=args.batch_size,
         epochs=args.epochs,
-        out_dir=out_dir
+        out_dir=out_dir,
+        loss_type=args.loss_type,
+        q_loss_weight=args.q_loss_weight,
+        q_upper_weight=args.q_upper_weight,
+        q_grad_weight=args.q_grad_weight,
     )
 
     print("Evaluating ...")

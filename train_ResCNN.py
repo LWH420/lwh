@@ -498,6 +498,15 @@ def evaluate_model(model, X_test, Y_test, ds_out, out_dir, var_names=("U","V","T
 
     metrics_out["r2_by_level_norm"] = r2_by_level
     metrics_out["rmse_by_level_norm"] = rmse_by_level
+    if "Q" in var_names:
+        q_idx = var_names.index("Q")
+        q_rmse_lev = np.array(rmse_by_level["Q"], dtype=np.float32)
+        nlev = q_rmse_lev.shape[0]
+        upper_start = int(np.floor(0.7 * nlev))
+        lower_end = int(np.ceil(0.3 * nlev))
+        metrics_out["q_rmse_upper_norm"] = float(np.nanmean(q_rmse_lev[upper_start:]))
+        metrics_out["q_rmse_lower_norm"] = float(np.nanmean(q_rmse_lev[:lower_end]))
+        metrics_out["q_rmse_all_norm"] = float(np.nanmean(q_rmse_lev))
 
     lev_values = ds_out["lev"].values if "lev" in ds_out.coords else np.arange(Y_test.shape[1])
 
@@ -593,6 +602,28 @@ def build_run_name(args):
     )
     return run_name
 def main():
+    def apply_norm_preset(args):
+        # 按归一化方式给出默认推荐配置：
+        # 1) 全变量统一归一化：Q动态范围更吃亏，增加Q分支与Q约束
+        # 2) 逐层归一化：层间尺度已平衡，可减小Q额外约束避免过拟合
+        if args.norm_mode == "global":
+            args.model_type = "rescnn_qbranch"
+            args.loss_type = "qhybrid"
+            args.learning_rate = 1e-4
+            args.batch_size = 256
+            args.q_loss_weight = 2.5
+            args.q_upper_weight = 3.5
+            args.q_grad_weight = 0.6
+        elif args.norm_mode == "level":
+            args.model_type = "rescnn"
+            args.loss_type = "qhybrid"
+            args.learning_rate = 8e-5
+            args.batch_size = 256
+            args.q_loss_weight = 1.2
+            args.q_upper_weight = 2.0
+            args.q_grad_weight = 0.25
+        return args
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_file", type=str,
                         default=os.path.join(data_path,inputdata))
@@ -600,6 +631,8 @@ def main():
                         default=os.path.join(data_path,outputdata))
     parser.add_argument("--model_type", type=str, default="rescnn",
                         choices=["mlp", "rescnn", "rescnn_qbranch", "gru", "cnn", "2d_conv"])
+    parser.add_argument("--norm_mode", type=str, default="custom",
+                        choices=["custom", "global", "level"])
     parser.add_argument("--ntimes_input", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
@@ -611,6 +644,7 @@ def main():
     parser.add_argument("--q_grad_weight", type=float, default=0.5)
 
     args = parser.parse_args()
+    args = apply_norm_preset(args)
     run_name = build_run_name(args)
     out_dir = os.path.join(data_path, run_name)
     os.makedirs(out_dir, exist_ok=True)

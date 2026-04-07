@@ -101,25 +101,37 @@ def build_dataset_from_normalized_nc(
 
     # -------- 静态输入 --------
     static_np = None
+    static_time_np = None
     used_static = []
-    tmp = []
+    used_static_const = []
+    used_static_time = []
+    tmp_const = []
+    tmp_time = []
     for v in static_vars:
         if v in ds_in:
             da = ds_in[v]
-            if "time" in da.dims:
-                da = da.isel(time=0, drop=True)
+            has_time = "time" in da.dims
             for dim in list(da.dims):
-                if dim not in spatial_dims:
+                if dim not in (["time"] + spatial_dims):
                     da = da.isel({dim: 0}, drop=True)
-            da = da.transpose(*spatial_dims)
-            da = da.stack(grid=spatial_dims)
-            tmp.append(da)
+            if has_time:
+                da = da.transpose("time", *spatial_dims).stack(grid=spatial_dims)
+                tmp_time.append(da)
+                used_static_time.append(v)
+            else:
+                da = da.transpose(*spatial_dims).stack(grid=spatial_dims)
+                tmp_const.append(da)
+                used_static_const.append(v)
             used_static.append(v)
 
-    if len(tmp) > 0:
-        static_da = xr.concat(tmp, dim="svar").assign_coords(svar=used_static)
+    if len(tmp_const) > 0:
+        static_da = xr.concat(tmp_const, dim="svar").assign_coords(svar=used_static_const)
         static_da = static_da.transpose("grid", "svar")   # (grid, svar)
         static_np = static_da.values.astype(np.float32)
+    if len(tmp_time) > 0:
+        static_time_da = xr.concat(tmp_time, dim="svar").assign_coords(svar=used_static_time)
+        static_time_da = static_time_da.transpose("time", "grid", "svar")  # (time, grid, svar)
+        static_time_np = static_time_da.values.astype(np.float32)
 
     # -------- 位置特征 --------
     geo_np = None
@@ -166,6 +178,13 @@ def build_dataset_from_normalized_nc(
                 ],
                 axis=-1
             ).astype(np.float32)
+        elif "grid" in x_dyn.dims:
+            # 没有经纬度时，至少保留grid位置编码帮助学习空间结构
+            ngrid_tmp = x_dyn.sizes["grid"]
+            grid_idx = np.arange(ngrid_tmp, dtype=np.float32)
+            if ngrid_tmp > 1:
+                grid_idx = grid_idx / float(ngrid_tmp - 1)
+            geo_np = grid_idx[:, None]
 
     x_np = x_dyn.values   # (time, lev, grid, var)
     y_np = y_all.values   # (time, lev, grid, var)
@@ -193,6 +212,11 @@ def build_dataset_from_normalized_nc(
             s = np.repeat(static_np[:, None, None, :], ntimes_input, axis=1)
             s = np.repeat(s, nlev, axis=2)   # (grid, window, lev, static)
             feats.append(s)
+        if static_time_np is not None:
+            s_t = static_time_np[t - ntimes_input + 1:t + 1]  # (window, grid, static_t)
+            s_t = np.transpose(s_t, (1, 0, 2))  # (grid, window, static_t)
+            s_t = np.repeat(s_t[:, :, None, :], nlev, axis=2)  # (grid, window, lev, static_t)
+            feats.append(s_t)
         if geo_np is not None:
             g = np.repeat(geo_np[:, None, None, :], ntimes_input, axis=1)
             g = np.repeat(g, nlev, axis=2)   # (grid, window, lev, geo)
@@ -236,6 +260,8 @@ def build_dataset_from_normalized_nc(
         "used_dynamic_vars": list(dynamic_vars),
         "used_output_vars": list(output_vars),
         "used_static_vars": used_static,
+        "used_static_const_vars": used_static_const,
+        "used_static_time_vars": used_static_time,
     }
 
     return (

@@ -1,7 +1,5 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model, regularizers
-import tensorflow as tf
-from tensorflow.keras import layers, Model
 
 def build_gru_model(ntimes_input, nlev, nfeat, out_vars=4, hidden=128, dropout=0.1):
     inp = layers.Input(shape=(ntimes_input, nlev, nfeat))
@@ -85,6 +83,62 @@ def build_rescnn_model(ntimes_input, nlev, nfeat, out_vars=4,
     x_mean = tf.reduce_mean(x, axis=-1, keepdims=True)
     out = layers.Conv1D(out_vars, 1, padding="same", activation="tanh")(x)
     return Model(inp, out, name="ResCNN_TCN")
+
+
+def build_rescnn_qbranch_model(
+    ntimes_input,
+    nlev,
+    nfeat,
+    out_vars=4,
+    filters=256,
+    kernel_size=3,
+    n_blocks=6,
+    dropout=0.1,
+):
+    """
+    针对Q新增专门分支：
+    1) 主干学习共享动力场（U/V/T/Q）
+    2) UVT与Q解耦输出，Q分支采用更深空洞卷积，增强垂直结构学习
+    """
+    inp = layers.Input(shape=(ntimes_input, nlev, nfeat))
+
+    x = layers.Permute((2, 1, 3))(inp)  # (lev, time, feat)
+    x = layers.Reshape((nlev, ntimes_input * nfeat))(x)
+    x = layers.Conv1D(filters, 1, padding="same")(x)
+
+    dilation_list = [1, 2, 4, 8, 16, 32]
+    trunk = x
+    for i in range(n_blocks):
+        trunk = residual_block_1d(
+            trunk,
+            filters=filters,
+            kernel_size=kernel_size,
+            dilation_rate=dilation_list[i % len(dilation_list)],
+            dropout_rate=dropout,
+            use_bn=True,
+        )
+
+    # UVT输出头
+    uvt = layers.Conv1D(filters // 2, 1, padding="same", activation="relu")(trunk)
+    uvt = layers.Conv1D(3, 1, padding="same", activation="tanh", name="uvt_head")(uvt)
+
+    # Q输出头：额外垂直混合与注意力
+    q = trunk
+    for d in [4, 8, 16]:
+        q = residual_block_1d(
+            q,
+            filters=filters,
+            kernel_size=kernel_size,
+            dilation_rate=d,
+            dropout_rate=dropout,
+            use_bn=True,
+        )
+    q = layers.MultiHeadAttention(num_heads=4, key_dim=max(filters // 8, 16))(q, q)
+    q = layers.Conv1D(filters // 2, 1, padding="same", activation="relu")(q)
+    q = layers.Conv1D(1, 1, padding="same", activation="tanh", name="q_head")(q)
+
+    out = layers.Concatenate(axis=-1)([uvt, q])
+    return Model(inp, out, name="ResCNN_QBranch")
 
 def build_mlp_model(ntimes_input, nlev, nfeat, out_vars=4, hidden=512, dropout=0.1):
     inp = layers.Input(shape=(ntimes_input, nlev, nfeat))
@@ -182,3 +236,45 @@ def weighted_mse(y_true, y_pred):
     nlev = tf.shape(y_true)[1]
     weights = tf.linspace(2.0, 1.0, nlev)[:, tf.newaxis]  # shape: (lev,1)
     return tf.reduce_mean(weights * tf.square(y_true - y_pred))
+
+
+def make_q_hybrid_loss(
+    q_idx=3,
+    q_loss_weight=2.0,
+    q_upper_weight=3.0,
+    q_grad_weight=0.5,
+):
+    """
+    混合损失：
+    - 全变量MSE
+    - Q变量加权MSE（顶层权重更高）
+    - Q垂直梯度约束（强化垂直结构）
+    """
+
+    def loss_fn(y_true, y_pred):
+        all_mse = tf.reduce_mean(tf.square(y_true - y_pred))
+
+        q_true = y_true[:, :, q_idx]
+        q_pred = y_pred[:, :, q_idx]
+
+        nlev = tf.shape(q_true)[1]
+        upper_weights = tf.linspace(q_upper_weight, 1.0, nlev)[tf.newaxis, :]
+        q_mse = tf.reduce_mean(upper_weights * tf.square(q_true - q_pred))
+
+        q_true_grad = q_true[:, 1:] - q_true[:, :-1]
+        q_pred_grad = q_pred[:, 1:] - q_pred[:, :-1]
+        q_grad_mse = tf.reduce_mean(tf.square(q_true_grad - q_pred_grad))
+
+        return all_mse + q_loss_weight * q_mse + q_grad_weight * q_grad_mse
+
+    return loss_fn
+
+
+def q_rmse_metric(q_idx=3):
+    def metric(y_true, y_pred):
+        q_true = y_true[:, :, q_idx]
+        q_pred = y_pred[:, :, q_idx]
+        return tf.sqrt(tf.reduce_mean(tf.square(q_true - q_pred)))
+
+    metric.__name__ = "q_rmse"
+    return metric

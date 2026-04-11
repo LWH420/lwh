@@ -58,6 +58,7 @@ def build_dataset_from_normalized_nc(
     output_file,
     ntimes_input=5,
     dynamic_vars=("U", "V", "T", "Q"),
+    output_vars=("U", "V", "T", "Q"),
     static_vars=("PHIS", "LANDFRAC"),
     add_geo_features=True,
     train_ratio=0.6,
@@ -66,60 +67,102 @@ def build_dataset_from_normalized_nc(
     ds_in = xr.open_dataset(input_file, decode_times=False)
     ds_out = xr.open_dataset(output_file, decode_times=False)
 
+    # 自动识别空间维度（支持 lat/lon 或已有 grid）
+    sample_dyn = ds_in[dynamic_vars[0]]
+    spatial_dims = [d for d in sample_dyn.dims if d not in ("time", "lev")]
+    if len(spatial_dims) == 0:
+        raise ValueError(f"{dynamic_vars[0]} 未找到空间维度，dims={sample_dyn.dims}")
+
     # -------- 动态输入 --------
     x_list = []
     for v in dynamic_vars:
         if v not in ds_in:
             raise KeyError(f"{v} 不在输入文件中")
-        x_list.append(ds_in[v])   # (time, lev, grid)
+        da = ds_in[v]
+        da = da.transpose("time", "lev", *spatial_dims)
+        da = da.stack(grid=spatial_dims)
+        x_list.append(da)   # (time, lev, grid)
 
     x_dyn = xr.concat(x_list, dim="var").assign_coords(var=list(dynamic_vars))
     x_dyn = x_dyn.transpose("time", "lev", "grid", "var")   # (time, lev, grid, var)
 
     # -------- 输出 --------
     y_list = []
-    for v in dynamic_vars:
+    for v in output_vars:
         if v not in ds_out:
             raise KeyError(f"{v} 不在输出文件中")
-        y_list.append(ds_out[v])
+        da = ds_out[v]
+        da = da.transpose("time", "lev", *spatial_dims)
+        da = da.stack(grid=spatial_dims)
+        y_list.append(da)
 
-    y_all = xr.concat(y_list, dim="var").assign_coords(var=list(dynamic_vars))
+    y_all = xr.concat(y_list, dim="var").assign_coords(var=list(output_vars))
     y_all = y_all.transpose("time", "lev", "grid", "var")   # (time, lev, grid, var)
 
     # -------- 静态输入 --------
     static_np = None
+    static_time_np = None
     used_static = []
-    tmp = []
+    used_static_const = []
+    used_static_time = []
+    tmp_const = []
+    tmp_time = []
     for v in static_vars:
         if v in ds_in:
             da = ds_in[v]
-            if "time" in da.dims:
-                da = da.isel(time=0, drop=True)
-            tmp.append(da)
+            has_time = "time" in da.dims
+            for dim in list(da.dims):
+                if dim not in (["time"] + spatial_dims):
+                    da = da.isel({dim: 0}, drop=True)
+            if has_time:
+                da = da.transpose("time", *spatial_dims).stack(grid=spatial_dims)
+                tmp_time.append(da)
+                used_static_time.append(v)
+            else:
+                da = da.transpose(*spatial_dims).stack(grid=spatial_dims)
+                tmp_const.append(da)
+                used_static_const.append(v)
             used_static.append(v)
 
-    if len(tmp) > 0:
-        static_da = xr.concat(tmp, dim="svar").assign_coords(svar=used_static)
+    if len(tmp_const) > 0:
+        static_da = xr.concat(tmp_const, dim="svar").assign_coords(svar=used_static_const)
         static_da = static_da.transpose("grid", "svar")   # (grid, svar)
         static_np = static_da.values.astype(np.float32)
+    if len(tmp_time) > 0:
+        static_time_da = xr.concat(tmp_time, dim="svar").assign_coords(svar=used_static_time)
+        static_time_da = static_time_da.transpose("time", "grid", "svar")  # (time, grid, svar)
+        static_time_np = static_time_da.values.astype(np.float32)
 
     # -------- 位置特征 --------
     geo_np = None
     if add_geo_features:
-        lat_name_candidates = ["lat_grid", "grid_lat", "sample_lat", "lat_sel"]
-        lon_name_candidates = ["lon_grid", "grid_lon", "sample_lon", "lon_sel"]
-
         lat_grid = None
         lon_grid = None
 
-        for name in lat_name_candidates:
-            if name in ds_in:
-                lat_grid = ds_in[name].values
-                break
-        for name in lon_name_candidates:
-            if name in ds_in:
-                lon_grid = ds_in[name].values
-                break
+        # 优先从坐标读取（常见 lat/lon 场景）
+        lat_candidates = ["lat", "latitude"]
+        lon_candidates = ["lon", "longitude"]
+
+        lat_name = next((n for n in lat_candidates if n in ds_in.coords), None)
+        lon_name = next((n for n in lon_candidates if n in ds_in.coords), None)
+        if lat_name is not None and lon_name is not None:
+            lat_1d = ds_in.coords[lat_name].values
+            lon_1d = ds_in.coords[lon_name].values
+            lat_2d, lon_2d = np.meshgrid(lat_1d, lon_1d, indexing="ij")
+            lat_grid = lat_2d.reshape(-1)
+            lon_grid = lon_2d.reshape(-1)
+        else:
+            # 兼容已有按grid存储的经纬度变量
+            lat_name_candidates = ["lat_grid", "grid_lat", "sample_lat", "lat_sel"]
+            lon_name_candidates = ["lon_grid", "grid_lon", "sample_lon", "lon_sel"]
+            for name in lat_name_candidates:
+                if name in ds_in:
+                    lat_grid = ds_in[name].values.reshape(-1)
+                    break
+            for name in lon_name_candidates:
+                if name in ds_in:
+                    lon_grid = ds_in[name].values.reshape(-1)
+                    break
 
         if (lat_grid is not None) and (lon_grid is not None):
             lat_rad = np.deg2rad(lat_grid)
@@ -135,6 +178,13 @@ def build_dataset_from_normalized_nc(
                 ],
                 axis=-1
             ).astype(np.float32)
+        elif "grid" in x_dyn.dims:
+            # 没有经纬度时，至少保留grid位置编码帮助学习空间结构
+            ngrid_tmp = x_dyn.sizes["grid"]
+            grid_idx = np.arange(ngrid_tmp, dtype=np.float32)
+            if ngrid_tmp > 1:
+                grid_idx = grid_idx / float(ngrid_tmp - 1)
+            geo_np = grid_idx[:, None]
 
     x_np = x_dyn.values   # (time, lev, grid, var)
     y_np = y_all.values   # (time, lev, grid, var)
@@ -162,6 +212,11 @@ def build_dataset_from_normalized_nc(
             s = np.repeat(static_np[:, None, None, :], ntimes_input, axis=1)
             s = np.repeat(s, nlev, axis=2)   # (grid, window, lev, static)
             feats.append(s)
+        if static_time_np is not None:
+            s_t = static_time_np[t - ntimes_input + 1:t + 1]  # (window, grid, static_t)
+            s_t = np.transpose(s_t, (1, 0, 2))  # (grid, window, static_t)
+            s_t = np.repeat(s_t[:, :, None, :], nlev, axis=2)  # (grid, window, lev, static_t)
+            feats.append(s_t)
         if geo_np is not None:
             g = np.repeat(geo_np[:, None, None, :], ntimes_input, axis=1)
             g = np.repeat(g, nlev, axis=2)   # (grid, window, lev, geo)
@@ -203,7 +258,10 @@ def build_dataset_from_normalized_nc(
         "time_index": time_index,
         "grid_index": grid_index,
         "used_dynamic_vars": list(dynamic_vars),
+        "used_output_vars": list(output_vars),
         "used_static_vars": used_static,
+        "used_static_const_vars": used_static_const,
+        "used_static_time_vars": used_static_time,
     }
 
     return (
@@ -212,6 +270,12 @@ def build_dataset_from_normalized_nc(
         X[test_mask],  Y[test_mask],
         ds_in, ds_out, meta
     )
+
+
+def parse_var_list(text):
+    if text is None:
+        return tuple()
+    return tuple([x.strip() for x in text.split(",") if x.strip()])
 
 #======================================================
 #3.train and evaluate
@@ -310,20 +374,30 @@ def weights_file_to_nc(h5_file, out_dir):
     print(f"Finished exporting {exported} layers from {h5_file}")
 
 def compile_and_train(model, X_train, Y_train, X_val, Y_val,
-                      lr=1e-4, batch_size=256, epochs=100, out_dir="./ResCNN_results"):
+                      lr=1e-4, batch_size=256, epochs=100, out_dir="./ResCNN_results",
+                      loss_type="qhybrid", q_loss_weight=2.0, q_upper_weight=3.0, q_grad_weight=0.5,
+                      output_vars=("U", "V", "T", "Q")):
     os.makedirs(out_dir, exist_ok=True)
-    if model == "2d_conv":
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(lr),
-            loss=Res.weighted_mse,#loss=tf.keras.losses.Huber(),
-            metrics=[tf.keras.metrics.MeanSquaredError()]
+    q_idx = output_vars.index("Q") if "Q" in output_vars else None
+    if loss_type == "weighted_mse":
+        loss_fn = Res.weighted_mse
+    elif loss_type == "qhybrid" and q_idx is not None:
+        loss_fn = Res.make_q_hybrid_loss(
+            q_idx=q_idx,
+            q_loss_weight=q_loss_weight,
+            q_upper_weight=q_upper_weight,
+            q_grad_weight=q_grad_weight,
         )
     else:
-        model.compile(
+        loss_fn = tf.keras.losses.Huber()
+    metrics = [tf.keras.metrics.MeanSquaredError()]
+    if q_idx is not None:
+        metrics.append(Res.q_rmse_metric(q_idx=q_idx))
+    model.compile(
         optimizer=tf.keras.optimizers.Adam(lr),
-        loss=tf.keras.losses.Huber(),
-        metrics=[tf.keras.metrics.MeanSquaredError()]
-        )
+        loss=loss_fn,
+        metrics=metrics
+    )
     best_h5=os.path.join(out_dir,"best_model.h5")
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
@@ -493,6 +567,15 @@ def evaluate_model(model, X_test, Y_test, ds_out, out_dir, var_names=("U","V","T
 
     metrics_out["r2_by_level_norm"] = r2_by_level
     metrics_out["rmse_by_level_norm"] = rmse_by_level
+    if "Q" in var_names:
+        q_idx = var_names.index("Q")
+        q_rmse_lev = np.array(rmse_by_level["Q"], dtype=np.float32)
+        nlev = q_rmse_lev.shape[0]
+        upper_start = int(np.floor(0.7 * nlev))
+        lower_end = int(np.ceil(0.3 * nlev))
+        metrics_out["q_rmse_upper_norm"] = float(np.nanmean(q_rmse_lev[upper_start:]))
+        metrics_out["q_rmse_lower_norm"] = float(np.nanmean(q_rmse_lev[:lower_end]))
+        metrics_out["q_rmse_all_norm"] = float(np.nanmean(q_rmse_lev))
 
     lev_values = ds_out["lev"].values if "lev" in ds_out.coords else np.arange(Y_test.shape[1])
 
@@ -588,18 +671,61 @@ def build_run_name(args):
     )
     return run_name
 def main():
+    def apply_norm_preset(args):
+        # 按归一化方式给出默认推荐配置：
+        # 1) 全变量统一归一化：Q动态范围更吃亏，增加Q分支与Q约束
+        # 2) 逐层归一化：层间尺度已平衡，可减小Q额外约束避免过拟合
+        if args.norm_mode == "global" and "Q" in args.output_vars:
+            args.model_type = "rescnn_qbranch"
+            args.loss_type = "qhybrid"
+            args.learning_rate = 1e-4
+            args.batch_size = 256
+            args.q_loss_weight = 2.5
+            args.q_upper_weight = 3.5
+            args.q_grad_weight = 0.6
+        elif args.norm_mode == "level" and "Q" in args.output_vars:
+            args.model_type = "rescnn"
+            args.loss_type = "qhybrid"
+            args.learning_rate = 8e-5
+            args.batch_size = 256
+            args.q_loss_weight = 1.2
+            args.q_upper_weight = 2.0
+            args.q_grad_weight = 0.25
+        return args
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_file", type=str,
                         default=os.path.join(data_path,inputdata))
     parser.add_argument("--output_file", type=str,
                         default=os.path.join(data_path,outputdata))
-    parser.add_argument("--model_type", type=str, default="rescnn", choices=["mlp", "rescnn", "gru","cnn","2d_conv"])
+    parser.add_argument("--model_type", type=str, default="rescnn",
+                        choices=["mlp", "rescnn", "rescnn_qbranch", "gru", "cnn", "2d_conv"])
+    parser.add_argument("--norm_mode", type=str, default="custom",
+                        choices=["custom", "global", "level"])
     parser.add_argument("--ntimes_input", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--loss_type", type=str, default="qhybrid",
+                        choices=["qhybrid", "weighted_mse", "huber"])
+    parser.add_argument("--q_loss_weight", type=float, default=2.0)
+    parser.add_argument("--q_upper_weight", type=float, default=3.0)
+    parser.add_argument("--q_grad_weight", type=float, default=0.5)
+    parser.add_argument("--input_dynamic_vars", type=str, default="U,V,T,Q")
+    parser.add_argument("--output_vars", type=str, default="U,V,T,Q")
+    parser.add_argument("--static_vars", type=str, default="PHIS,LANDFRAC")
 
     args = parser.parse_args()
+    args.input_dynamic_vars = parse_var_list(args.input_dynamic_vars)
+    args.output_vars = parse_var_list(args.output_vars)
+    args.static_vars = parse_var_list(args.static_vars)
+
+    if len(args.input_dynamic_vars) == 0:
+        raise ValueError("--input_dynamic_vars 不能为空")
+    if len(args.output_vars) == 0:
+        raise ValueError("--output_vars 不能为空")
+
+    args = apply_norm_preset(args)
     run_name = build_run_name(args)
     out_dir = os.path.join(data_path, run_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -614,8 +740,9 @@ def main():
             input_file=args.input_file,
             output_file=args.output_file,
             ntimes_input=args.ntimes_input,
-            dynamic_vars=("U","V","T","Q"),
-            static_vars=("PHIS","LANDFRAC"),
+            dynamic_vars=args.input_dynamic_vars,
+            output_vars=args.output_vars,
+            static_vars=args.static_vars,
             add_geo_features=True,
         )
 
@@ -637,6 +764,10 @@ def main():
         model = Res.build_mlp_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
     elif args.model_type == "rescnn":
         model = Res.build_rescnn_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
+    elif args.model_type == "rescnn_qbranch":
+        if out_vars != 4 or tuple(args.output_vars) != ("U", "V", "T", "Q"):
+            raise ValueError("rescnn_qbranch 当前仅支持 output_vars=U,V,T,Q")
+        model = Res.build_rescnn_qbranch_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
     elif args.model_type == "gru":
         model = Res.build_gru_model(ntimes_input, nlev, nfeat, out_vars=out_vars)
     elif args.model_type == "cnn":
@@ -657,7 +788,12 @@ def main():
         lr=args.learning_rate,
         batch_size=args.batch_size,
         epochs=args.epochs,
-        out_dir=out_dir
+        out_dir=out_dir,
+        loss_type=args.loss_type,
+        q_loss_weight=args.q_loss_weight,
+        q_upper_weight=args.q_upper_weight,
+        q_grad_weight=args.q_grad_weight,
+        output_vars=args.output_vars,
     )
 
     print("Evaluating ...")
@@ -666,7 +802,7 @@ def main():
         X_test, Y_test,
         ds_out,
         out_dir=out_dir,
-        var_names=("U","V","T","Q")
+        var_names=args.output_vars
     )
     config_to_save = vars(args).copy()
     config_to_save["run_name"] = run_name
